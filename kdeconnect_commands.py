@@ -29,10 +29,23 @@ MAC_CLI = "/Applications/KDE Connect.app/Contents/MacOS/kdeconnect-cli"
 # ControlPath=none: sandboxes cannot bind the multiplexing socket.
 SSH = ["ssh", "-o", "ControlPath=none", "-o", "ControlMaster=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20"]
 
-# The daemons run with a bare environment, so each side exports what its tools need.
-CACHY_ENV = ("export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
-             "XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 DISPLAY=:0; ")
-MAC_ENV = "export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin; "
+# Installed on both machines by `apply`. Cross-machine entries call it over ssh because
+# ssh sessions (and the daemons) start with a bare environment. -d detaches, -b takes
+# base64 so quotes survive ssh and fish, the login shell on cachy.
+HELPER_PATH = ".local/bin/kcc-run"
+HELPER = r'''#!/bin/sh
+# kcc-run [-d] [-b BASE64 | COMMAND...]: run a command with the desktop environment set.
+case $(uname) in
+  Darwin) export PATH=/opt/homebrew/bin:$HOME/.local/bin:$HOME/Library/Python/3.12/bin:/usr/bin:/bin:/usr/sbin:/sbin ;;
+  *) export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus XDG_RUNTIME_DIR=/run/user/$(id -u) \
+            WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 ;;
+esac
+detach=
+[ "$1" = -d ] && { detach=1; shift; }
+if [ "$1" = -b ]; then set -- "$(printf %s "$2" | base64 -d)"; else set -- "$*"; fi
+if [ -n "$detach" ]; then nohup sh -c "$1" >/dev/null 2>&1 </dev/null & else exec sh -c "$1"; fi
+'''
+SAFE = re.compile(r"[\w./@%+=:,-]+( [\w./@%+=:,-]+)*")
 
 
 def osa(s):
@@ -47,12 +60,30 @@ def spotify(verb):
     return f"pgrep -x Spotify >/dev/null && " + osa(f'tell application "Spotify" to {verb}')
 
 
+def over_ssh(host, cmd):
+    m = re.fullmatch(r"nohup (.+?) >/dev/null 2>&1 &", cmd)
+    flag, plain = ("-d ", m.group(1)) if m else ("", cmd)
+    body = plain if SAFE.fullmatch(plain) else "-b " + base64.b64encode(plain.encode()).decode()
+    return f"ssh -o BatchMode=yes -o ConnectTimeout=10 {host} {HELPER_PATH} {flag}{body}"
+
+
+def km(macro_id):
+    return osa(f'tell application "Keyboard Maestro Engine" to do script "{macro_id}"')
+
+
 def shortcut(component, name):
     return f'qdbus6 org.kde.kglobalaccel /component/{component} invokeShortcut "{name}"'
 
 
 BRIGHT = ("qdbus6 org.kde.Solid.PowerManagement /org/kde/Solid/PowerManagement/Actions/BrightnessControl "
           "org.kde.Solid.PowerManagement.Actions.BrightnessControl.setBrightness")
+PNGPASTE = "/opt/homebrew/bin/pngpaste"
+# pbcopy/pbpaste fail in ssh sessions (no pasteboard session); osascript works.
+MAC_TXT_IN = ("cat >/tmp/kcc.txt && osascript -e 'set the clipboard to "
+              "(read (POSIX file \"/tmp/kcc.txt\") as «class utf8»)'")
+MAC_TXT_OUT = "printf %s \"$(osascript -e 'the clipboard as text')\""
+MAC_IMG_IN = ("cat >/tmp/kcc.png && osascript -e 'set the clipboard to "
+              "(read (POSIX file \"/tmp/kcc.png\") as «class PNGf»)'")
 NOW = "$(date +%Y%m%d_%H%M%S)"
 SND = "/usr/share/sounds/freedesktop/stereo"
 BG = ">/dev/null 2>&1 &"
@@ -103,11 +134,20 @@ CATALOGUE = [
     ("Screenshot", "Full Screen", f'mkdir -p "$HOME/Desktop" && screencapture -x "$HOME/Desktop/shot_{NOW}.png"',
      f'mkdir -p "$HOME/Pictures" && spectacle -b -f -o "$HOME/Pictures/shot_{NOW}.png"'),
     ("Screenshot", "To Clipboard", "screencapture -xc", "spectacle -b -f -c"),
+    ("Screenshot", "Region To Clipboard", "screencapture -ic", "spectacle -b -r -c"),
+    ("Screenshot", "Window To Clipboard", "screencapture -iwc", "spectacle -b -a -c"),
     ("Sound", "Ping", "afplay /System/Library/Sounds/Ping.aiff", f"paplay {SND}/message.oga"),
     ("Sound", "Alert", "afplay /System/Library/Sounds/Sosumi.aiff", f"paplay {SND}/dialog-warning.oga"),
     ("Notify", "Hello", osa('display notification "Hello" with title "KDE Connect"'),
      'notify-send "KDE Connect" "Hello"'),
     ("Clipboard", "Clear", "pbcopy </dev/null", "wl-copy --clear"),
+    # Each side pushes its own clipboard to, or pulls from, the other machine.
+    ("Clipboard", "Send Text to cachy", "pbpaste | " + over_ssh(CACHY_HOST, "wl-copy >/dev/null 2>&1"), None),
+    ("Clipboard", "Send Text to Mac", None, "wl-paste -n | " + over_ssh(MAC_HOST, MAC_TXT_IN)),
+    ("Clipboard", "Send Image to cachy", PNGPASTE + " - | " + over_ssh(CACHY_HOST, "wl-copy -t image/png >/dev/null 2>&1"), None),
+    ("Clipboard", "Send Image to Mac", None, "wl-paste -t image/png | " + over_ssh(MAC_HOST, MAC_IMG_IN)),
+    ("Clipboard", "Pull Text from cachy", over_ssh(CACHY_HOST, "wl-paste -n") + " | pbcopy", None),
+    ("Clipboard", "Pull Text from Mac", None, over_ssh(MAC_HOST, MAC_TXT_OUT) + " | wl-copy >/dev/null 2>&1"),
     ("Apps", "Waterfox", "open -a Waterfox", f"nohup waterfox {BG}"),
     ("Apps", "Chrome", 'open -a "Google Chrome"', f"nohup google-chrome-stable {BG}"),
     ("Apps", "Obsidian", "open -a Obsidian", f"nohup obsidian {BG}"),
@@ -115,18 +155,36 @@ CATALOGUE = [
     ("Apps", "Terminal", "open -a Ghostty", f"nohup ghostty {BG}"),
     ("Apps", "Files", "open -a Finder", f"nohup dolphin {BG}"),
     ("Apps", "Spotify", "open -a Spotify", None),
+    ("Apps", "Waterfox Private Window", "open -na Waterfox --args --private-window",
+     f"nohup waterfox --private-window {BG}"),
+    ("Apps", "Waterfox Open Clipboard URL", 'open -a Waterfox "$(pbpaste)"',
+     f'nohup sh -c \'waterfox "$(wl-paste -n)"\' {BG}'),
+    ("Obsidian", "Daily Note", 'open "obsidian://daily?vault=Obsidian"',
+     'xdg-open "obsidian://daily?vault=obsidian"'),
+    ("Obsidian", "Note from Clipboard",
+     f'open "obsidian://new?vault=Obsidian&clipboard=true&name=Clip%20{NOW}"',
+     f'xdg-open "obsidian://new?vault=obsidian&clipboard=true&name=Clip%20{NOW}"'),
+    ("Desktop", "Show Desktop", 'shortcuts run "Show Desktop"', shortcut("kwin", "Show Desktop")),
+    ("Desktop", "Overview", 'open -a "Mission Control"', shortcut("kwin", "Overview")),
+    ("Desktop", "Close Window", None, shortcut("kwin", "Window Close")),
+    ("Desktop", "Fullscreen Window", None, shortcut("kwin", "Window Fullscreen")),
+    ("Desktop", "Night Color Toggle", None, shortcut("kwin", "Toggle Night Color")),
+    ("Desktop", "Tile Windows", 'shortcuts run "Tile Windows"', None),
+    ("Keyboard Maestro", "Quick Capture", km("A7B8C9D0-E1F2-3456-GHIJ-567890123456"), None),
+    ("Keyboard Maestro", "Tailscale Status", km("2A2EE131-985F-42E1-ACA6-0ABC1AD705DF"), None),
+    ("Keyboard Maestro", "Docker Running Containers", km("A0E63AAA-BCF4-4A1C-A343-A75880B23918"), None),
+    ("Status", "Uptime and Disk",
+     osa('display notification (do shell script "uptime | sed s/,.*//; df -h / | tail -1") with title "m3"'),
+     'notify-send cachy "$(uptime -p; df -h / | tail -1)"'),
+    ("Status", "IP Address", osa('display notification (do shell script "ipconfig getifaddr en0") with title "m3"'),
+     'notify-send cachy "$(hostname -I)"'),
+    ("Status", "Pending Updates", None, 'notify-send cachy "$(checkupdates | wc -l) updates"'),
 ]
 
 
 def entry_id(side, name):
     h = hashlib.md5(f"{side}|{name}".encode()).hexdigest()
     return f"_{h[:8]}_{h[8:12]}_{h[12:16]}_{h[16:20]}_{h[20:32]}_"
-
-
-def over_ssh(host, env, cmd):
-    # base64 keeps quotes intact and sidesteps fish, the login shell on cachy.
-    payload = base64.b64encode((env + cmd).encode()).decode()
-    return f'ssh -o BatchMode=yes -o ConnectTimeout=10 {host} "echo {payload} | base64 -d | sh"'
 
 
 def build(side):
@@ -137,12 +195,12 @@ def build(side):
             label = f"{group}: {name}"
             out[entry_id(side, label)] = {
                 "name": label,
-                "command": mac_cmd if side == "mac" else over_ssh(MAC_HOST, MAC_ENV, mac_cmd)}
+                "command": mac_cmd if side == "mac" else over_ssh(MAC_HOST, mac_cmd)}
         if cachy_cmd:
             label = f"{group}: {name} {MARK}"
             out[entry_id(side, label)] = {
                 "name": label,
-                "command": cachy_cmd if side == "cachy" else over_ssh(CACHY_HOST, CACHY_ENV, cachy_cmd)}
+                "command": cachy_cmd if side == "cachy" else over_ssh(CACHY_HOST, cachy_cmd)}
     return out
 
 
@@ -185,6 +243,23 @@ def on_cachy(script, retries=4):
     return run(SSH + [CACHY_HOST, "bash -s"], stdin=script, retries=retries)
 
 
+HELPER_INSTALLER = '''
+import base64, os, stat
+f = os.path.join(os.path.expanduser("~"), {path!r})
+new = base64.b64decode({data!r}).decode()
+old = open(f).read() if os.path.exists(f) else None
+if old == new:
+    print("helper unchanged")
+else:
+    os.makedirs(os.path.dirname(f), exist_ok=True)
+    if old is not None:
+        os.replace(f, f + ".bak")
+    open(f, "w").write(new)
+    os.chmod(f, 0o755)
+    print("helper written")
+'''
+
+
 def apply(dry):
     for side, path in (("mac", MAC_CFG), ("cachy", CACHY_CFG)):
         entries = build(side)
@@ -192,9 +267,10 @@ def apply(dry):
         if dry:
             continue
         data = base64.b64encode(config_line(entries).encode()).decode()
-        src = INSTALLER.format(path=path, data=data)
+        hdata = base64.b64encode(HELPER.encode()).decode()
+        src = (HELPER_INSTALLER.format(path=HELPER_PATH, data=hdata) + INSTALLER.format(path=path, data=data))
         p = run(["python3", "-"], src) if side == "mac" else run(SSH + [CACHY_HOST, "python3 -"], src, retries=4)
-        print(f"{side}: {p.stdout.strip() or p.stderr.strip()}")
+        print(f"{side}: {p.stdout.strip().replace(chr(10), ', ') or p.stderr.strip()}")
         if p.returncode:
             sys.exit(1)
 

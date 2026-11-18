@@ -54,10 +54,19 @@ Names read `Group: Name`, so the popup sorts into groups. Linux commands end in 
 | <img src="https://api.iconify.design/lucide/sun.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Display | Brightness Up, Down, Max, 50%, Min | no | yes |
 | <img src="https://api.iconify.design/lucide/moon.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Appearance | Dark Mode, Light Mode | yes | yes |
 | <img src="https://api.iconify.design/lucide/moon.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Appearance | Dark Mode Toggle | yes | no |
-| <img src="https://api.iconify.design/lucide/camera.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Screenshot | Full Screen, To Clipboard | yes | yes |
-| <img src="https://api.iconify.design/lucide/bell.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Sound, Notify, Clipboard | Ping, Alert, Hello, Clear | yes | yes |
-| <img src="https://api.iconify.design/lucide/app-window.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Apps | Waterfox, Chrome, Obsidian, Feishin, Terminal, Files | yes | yes |
+| <img src="https://api.iconify.design/lucide/camera.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Screenshot | Full Screen, To Clipboard, Region To Clipboard, Window To Clipboard | yes | yes |
+| <img src="https://api.iconify.design/lucide/bell.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Sound, Notify | Ping, Alert, Hello | yes | yes |
+| <img src="https://api.iconify.design/lucide/clipboard.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Clipboard | Clear, Send Text to cachy, Send Text to Mac, Pull Text from cachy, Pull Text from Mac | yes | yes |
+| <img src="https://api.iconify.design/lucide/clipboard.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Clipboard | Send Image to cachy, Send Image to Mac | yes | yes |
+| <img src="https://api.iconify.design/lucide/app-window.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Apps | Waterfox, Chrome, Obsidian, Feishin, Terminal, Files, Waterfox Private Window, Waterfox Open Clipboard URL | yes | yes |
 | <img src="https://api.iconify.design/lucide/app-window.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Apps | Spotify | yes | no |
+| <img src="https://api.iconify.design/lucide/notebook-pen.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Obsidian | Daily Note, Note from Clipboard (via `obsidian://` links) | yes | yes |
+| <img src="https://api.iconify.design/lucide/layout-dashboard.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Desktop | Show Desktop, Overview | yes | yes |
+| <img src="https://api.iconify.design/lucide/layout-dashboard.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Desktop | Close Window, Fullscreen Window, Night Color Toggle | no | yes |
+| <img src="https://api.iconify.design/lucide/layout-dashboard.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Desktop | Tile Windows (Shortcuts) | yes | no |
+| <img src="https://api.iconify.design/lucide/keyboard.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Keyboard Maestro | Quick Capture, Tailscale Status, Docker Running Containers | yes | no |
+| <img src="https://api.iconify.design/lucide/activity.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Status | Uptime and Disk, IP Address | yes | yes |
+| <img src="https://api.iconify.design/lucide/activity.svg?color=%231d99f3" height="16" align="absmiddle" alt=""> Status | Pending Updates | no | yes |
 
 `python3 kdeconnect_commands.py show` prints the same table from the script.
 
@@ -106,8 +115,9 @@ flowchart LR
 | Piece | Behavior |
 | --- | --- |
 | Local command | Runs directly with the daemon's bare environment. |
-| Cross-machine command | `ssh -o BatchMode=yes HOST "echo BASE64 \| base64 -d \| sh"`, so quoting survives and fish, the Linux login shell, never parses it. |
-| Environment | Each side exports what its tools need: `PATH` for Homebrew on the Mac, the D-Bus and Wayland variables on Linux. |
+| Cross-machine command | `ssh HOST .local/bin/kcc-run COMMAND`. A command with quotes or pipes is sent as `kcc-run -b BASE64` so quoting survives and fish, the Linux login shell, never parses it. |
+| `kcc-run` helper | Installed to `~/.local/bin` on both machines by `apply`. Sets `PATH` on the Mac, the D-Bus and Wayland variables on Linux, then runs the command. `-d` detaches it for apps. |
+| Clipboard over ssh | `pbcopy` and `pbpaste` fail in an ssh session, so Mac-side clipboard commands use `osascript`. |
 | Entry ids | A hash of the side and name, so ids are stable and a re-run changes nothing. |
 | Writes | The installer runs under `python3 -` on each machine, backs up the config first, then replaces only the `commands=` line. |
 
@@ -134,7 +144,8 @@ Everything is a constant at the top of `kdeconnect_commands.py`.
 | `MAC_HOST`, `CACHY_HOST` | ssh aliases for the two machines. |
 | `MAC_ID`, `CACHY_ID` | KDE Connect device ids, found as folder names under each machine's `kdeconnect` config folder. |
 | `MARK` | The suffix on Linux command names, a copyright sign by default. |
-| `CACHY_ENV`, `MAC_ENV` | Environment exported before a command that runs over ssh. |
+| `HELPER` | Source of `kcc-run`, including the environment each side exports. |
+| `km()` | Builds a Keyboard Maestro trigger by macro id. Replace the ids with your own macros. |
 | `CATALOGUE` | The commands: `(group, name, mac command or None, linux command or None)`. |
 
 <a name="troubleshooting"></a>
@@ -151,7 +162,7 @@ Reload both daemons with `restart`, then run `check`. A running daemon keeps its
 <details>
 <summary><img src="https://api.iconify.design/lucide/key-round.svg?color=%231d99f3" height="14" align="absmiddle" alt=""> <strong>Cross-Machine Command Does Nothing</strong></summary>
 
-Test the ssh hop from the machine that runs it: `ssh -o BatchMode=yes HOST true`. It must succeed with no password prompt. Under a sandbox, add `-o ControlPath=none` if multiplexing sockets are not allowed.
+Test the ssh hop from the machine that runs it: `ssh -o BatchMode=yes HOST .local/bin/kcc-run true`. It must succeed with no password prompt. Under a sandbox, add `-o ControlPath=none` if multiplexing sockets are not allowed.
 
 </details>
 
@@ -182,7 +193,7 @@ macOS has no command line for media keys, so Media entries on the Mac only contr
 
 ```text
 kdeconnect-commands/
-├── kdeconnect_commands.py   # catalogue, builder, installer, restart, check
+├── kdeconnect_commands.py   # catalogue, kcc-run helper, builder, installer, restart, check
 ├── README.md
 ├── LICENSE
 └── .gitignore
